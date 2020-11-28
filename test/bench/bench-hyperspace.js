@@ -4,7 +4,6 @@ Execute all hyperspace benchmarks:
 Filtering is possible, each argument must be matched by benchmark name:
 `npm run benchmark-hyperspace ram 1000`
 */
-const why = require('why-is-node-running') // should be your first require
 const Benchmark = require('benchmark');
 const { Client, Server } = require('hyperspace');
 const ram = require('random-access-memory')
@@ -12,6 +11,8 @@ const hdr = require("hdr-histogram-js")
 const microtime = require('microtime')
 const tmp = require('tmp-promise')
 const { createDHTServer } = require('../helpers/utils.js')
+const hyperdrive = require('hyperdrive')
+const { drive_ready, drive_writeFile, drive_readFile } = require('../helpers/utils.js')
 
 // configuration
 const useWasmForHistograms = false
@@ -24,10 +25,11 @@ const globalCtx = {} // holds benchmark -> histograms mapping
 options:
 readerCount - optional, number of parallel reader clients. Defaults to 1.
 blocks - optional, how many blocks to read and write. Defaults to 1.
-writeFun - (feed, client) - what to read / write
-readFun - (feed, blockIdx, client, discoveryKey) - what to read
+writeFun - (feedOrDrive, blockIdx, client) - what to read / write
+readFun - (feedOrDrive, blockIdx, client, discoveryKey) - what to read
 writerClientFun - optional. Writer client factory. Defaults to `() => new Client()`.
 readerClientFun - optional. Readers client factory. Defaults to `(idx) => new Client()`.
+useDrive - optional, Defaults to false
 */
 async function readAndWrite(histograms, server, options) {
     options.readerCount = options.readerCount ?? 1
@@ -53,50 +55,71 @@ async function readAndWrite(histograms, server, options) {
                 await Promise.all(readerClients.map(client => client.close()))
             })
         })
+        // TODO clean hyperdrives, hypercores as well
     }
     // write on writerClient
     let key = null, discoveryKey = null
     {
         const corestore = writerClient.corestore()
-        const feed = corestore.get()
-        await record(histograms, 'writerClient.core.ready()', async () => await feed.ready())
-        key = feed.key
-        discoveryKey = feed.discoveryKey
+        let feedOrDrive;
+        if (options.useDrive) {
+            feedOrDrive = hyperdrive(corestore)
+            await record(histograms, 'writerClient.drive.ready()', async () => await drive_ready(feedOrDrive))
+        } else {
+            feedOrDrive = corestore.get()
+            await record(histograms, 'writerClient.core.ready()', async () => await feedOrDrive.ready())
+        }
+        key = feedOrDrive.key
+        discoveryKey = feedOrDrive.discoveryKey
         await record(histograms, 'writerClient.writeAll', async () => {
             for (let blockIdx = 0; blockIdx < options.blocks; blockIdx++) {
                 await record(histograms, 'writerClient.write single block',
-                    async () => await options.writeFun(feed, writerClient))
+                    async () => await options.writeFun(feedOrDrive, blockIdx, writerClient))
             }
         })
     }
     // read on readerClients
     {
+        // corestores: [{client, corestore},...]
         const corestores = await record(histograms, 'readerClients.corestore()',
             () => readerClients.map(client => {
                 return {
                     client, corestore: client.corestore()
                 }
             }))
-        const feeds = await record(histograms, 'readerClients.corestores.get(key)',
+
+        let feedsOrDrives
+        let initializeByStoreAndKeyFun
+        let awaitReady
+        if (options.useDrive) {
+            initializeByStoreAndKeyFun = (corestore, key) => hyperdrive(corestore, key)
+            awaitReady = async (feedOrDrive) => await drive_ready(feedOrDrive)
+        } else {
+            initializeByStoreAndKeyFun = (corestore, key) => corestore.get(key)
+            awaitReady = async (feedOrDrive) => await feedOrDrive.ready()
+        }
+        feedsOrDrives = await record(histograms, 'readerClients.corestores.get(key)',
             () => corestores.map(clientAndCorestore => {
                 return {
-                    client: clientAndCorestore.client, feed: clientAndCorestore.corestore.get(key)
+                    client: clientAndCorestore.client,
+                    feedOrDrive: initializeByStoreAndKeyFun(clientAndCorestore.corestore, key)
                 }
             }))
-        // wait until all clients are ready
+        // wait until all feeds are ready
         await record(histograms, 'readerClients.feed.ready()',
-            async () => await Promise.all(feeds.map(feedAndClient => feedAndClient.feed.ready())))
+            async () => await Promise.all(feedsOrDrives.map(feedAndClient => awaitReady(feedAndClient.feedOrDrive))))
+
         // reading is parallel
         await record(histograms, 'readerClients.readAll', async () => {
-            const readAll = async function (feed, client) {
+            const readAll = async function (feedOrDrive, client) {
                 await record(histograms, 'readerClient.readAll', async () => {
                     for (let blockIdx = 0; blockIdx < options.blocks; blockIdx++) {
                         await record(histograms, 'readerClient.read single block',
-                            async () => await options.readFun(feed, blockIdx, client, discoveryKey))
+                            async () => await options.readFun(feedOrDrive, blockIdx, client, discoveryKey))
                     }
                 })
             }
-            await Promise.all(feeds.map(feedAndClient => readAll(feedAndClient.feed, feedAndClient.client)))
+            await Promise.all(feedsOrDrives.map(feedAndClient => readAll(feedAndClient.feedOrDrive, feedAndClient.client)))
         })
     }
     await cleanup()
@@ -335,12 +358,15 @@ async function runAll() {
                 blocks,
                 writerClientFun: () => new Client({ host: 'hyperspace-writer' }),
                 readerClientFun: (idx) => new Client({ host: 'hyperspace-reader' }),
-                writeFun: async (feed, client) => {
+                writeFun: async (feed, blockIdx, client) => {
                     await writeMessage(feed, message)
                     await client.network.configure(feed.discoveryKey, { announce: true, lookup: true, flush: true })
                 },
                 readFun: async (feed, blockIdx, client, discoveryKey) => {
-                    await client.network.configure(discoveryKey, { announce: false, lookup: true })
+                    if (blockIdx == 0) {
+                        // one time configuration
+                        await client.network.configure(discoveryKey, { announce: false, lookup: true })
+                    }
                     await readMessage(feed, blockIdx, message)
                 }
             }))
