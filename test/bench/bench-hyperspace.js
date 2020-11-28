@@ -13,8 +13,13 @@ const microtime = require('microtime')
 const tmp = require('tmp-promise')
 const { createDHTServer } = require('../helpers/utils.js')
 
+// configuration
 const useWasmForHistograms = false
 const outputHistogramsToPlotter = false
+
+// global state
+const globalCtx = {} // holds benchmark -> histograms mapping
+
 /*
 options:
 readerCount - optional, number of parallel reader clients. Defaults to 1.
@@ -114,6 +119,7 @@ async function readMessage(core, idx, message) {
 function outputHistograms(histograms) {
     const summaries = {}
     const encodedSummaries = {}
+    const output = { summaries, encodedSummaries }
     for (key in histograms) {
         const h = histograms[key]
         summaries[key] = {
@@ -129,6 +135,7 @@ function outputHistograms(histograms) {
     if (outputHistogramsToPlotter) {
         console.log(encodedSummaries) // view using https://hdrhistogram.github.io/HdrHistogramJSDemo/plotFiles.html
     }
+    return output
 }
 
 function newHist() {
@@ -162,13 +169,17 @@ function executeBenchmark(name, histograms, fn) {
                 record(histograms, 'total', async () => fn(deferred, histograms))
             }, { defer: true })
             .on('cycle', (event) => {
-                console.log(String(event.target));
-                outputHistograms(histograms)
+                finishBenchmark(name, event, histograms)
                 resolve();
 
             })
             .run();
     })
+}
+
+function finishBenchmark(name, event, histograms) {
+    console.log(String(event.target))
+    globalCtx[name] = outputHistograms(histograms)
 }
 
 function allocMessage(recordSize) {
@@ -353,8 +364,44 @@ async function runAll() {
     await executeBenchmark('Create DHT, two RAM servers, write 100 blocks with 1MB and read using another server and client',
         {},
         benchmarkDHTFn(message1MB, 100))
+
+    printCSV()
+}
+
+function printCSV() {
+    // find all columns
+    // globalCtx = {benchName1: {summaries: {hist1: {...}}, encodedSummaries: {hist1: {...}}}, ...}
+    const histColumnNames = Object.values(globalCtx).map(it => it.summaries).map(it => Object.keys(it)).flat()
+        .filter((value, index, self) => self.indexOf(value) === index) //uniq
+    const interestingHistogramKeys = ['mean', 'p99', 'max']
+    const histColumns = histColumnNames.map(it => interestingHistogramKeys.map(suffix => it + '.' + suffix)).flat()
+    const histTable = {}
+    for (const [benchName, histogramsOutput] of Object.entries(globalCtx)) {
+        const line = []
+        const histograms = histogramsOutput.summaries // { total: {mean: ..}, ..}
+        for (const [histName, histogram] of Object.entries(histograms)) {
+            for ([histKey, histValue] of Object.entries(histogram)) {
+                const name = histName + '.' + histKey // total.mean
+                const columnIdx = histColumns.indexOf(name)
+                if (columnIdx > -1) {
+                    line[columnIdx] = histValue
+                }
+            }
+        }
+        histTable[benchName] = line
+    }
+    //produce csv
+    const separator = ';'
+    const csvHeader = "benchmark name" + separator + histColumns.join(separator)
+    const csvLines = [csvHeader]
+    for (const [benchName, line] of Object.entries(histTable)) {
+        csvLines.push(benchName + separator + line.join(separator))
+    }
+    console.log('\nCSV\n')
+    console.log(csvLines.join('\n'))
 }
 
 require('events').EventEmitter.defaultMaxListeners = 20; // avoid warning when registering 10 reader clients
 if (useWasmForHistograms) hdr.initWebAssemblySync() // faster hdr metrics
 runAll() // execute benchmarks
+
