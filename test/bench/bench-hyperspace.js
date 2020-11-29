@@ -37,7 +37,7 @@ async function readAndWrite(histograms, server, options) {
     options.blocks = options.blocks ?? 1
     options.writerClientFun = options.writerClientFun ?? (() => new Client())
     options.readerClientFun = options.readerClientFun ?? ((idx) => new Client())
-    options.cleanups = options.cleanups ?? {}
+    const cleanups = options.cleanups ?? {}
 
     await record(histograms, 'server.ready', async () => await server.ready())
     const writerClient = options.writerClientFun()
@@ -55,7 +55,6 @@ async function readAndWrite(histograms, server, options) {
     cleanups['readAndWrite.readerClients.close'] = async () => {
         await Promise.all(readerClients.map(client => client.close()))
     }
-
     // write on writerClient
     let key = null, discoveryKey = null
     {
@@ -68,7 +67,8 @@ async function readAndWrite(histograms, server, options) {
             feedOrDrive = corestore.get()
             await record(histograms, 'writerClient.core.ready()', async () => await feedOrDrive.ready())
         }
-        cleanups['readAndWrite.writer.feedOrDrive.close'] = async () => await feedOrDrive.close()
+        // FIXME does not work
+        // cleanups['readAndWrite.writer.feedOrDrive.close'] = async () => await feedOrDrive.close()
         key = feedOrDrive.key
         discoveryKey = feedOrDrive.discoveryKey
         await record(histograms, 'writerClient.writeAll', async () => {
@@ -108,9 +108,11 @@ async function readAndWrite(histograms, server, options) {
         // wait until all feeds are ready
         await record(histograms, 'readerClients.feed.ready()',
             async () => await Promise.all(feedsOrDrives.map(feedAndClient => awaitReady(feedAndClient.feedOrDrive))))
-        cleanups['readAndWrite.writer.feedOrDrive.close'] = async () => {
-            await Promise.all(feedsOrDrives.map(feedAndClient => feedAndClient.feedOrDrive.close()))
-        }
+
+        // FIXME does not work
+        // cleanups['readAndWrite.readers.feedOrDrive.close'] = async () => {
+        //     await Promise.all(feedsOrDrives.map(feedAndClient => feedAndClient.feedOrDrive.close()))
+        // }
 
         // reading is parallel
         await record(histograms, 'readerClients.readAll', async () => {
@@ -186,6 +188,12 @@ function outputHistograms(histograms) {
 
 function newHist() {
     return hdr.build({ useWebAssembly: useWasmForHistograms })
+}
+
+function newFixedHist(value) {
+    const result = newHist()
+    result.recordValue(value)
+    return result
 }
 
 async function record(histograms, key, fn) {
@@ -267,93 +275,110 @@ async function runAll() {
             deferred.resolve()
         })
 
+
+
+    const singleServerFun = async function (deferred, histograms, useFS, options) {
+        histograms['blocks.fix'] = newFixedHist(options.blocks)
+        histograms['readerCount.fix'] = newFixedHist(options.readerCount)
+
+        const cleanups = { 'deferred': () => deferred.resolve() }
+        let tmpDir
+        if (useFS) {
+            tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
+            cleanups['tmpdir'] = async () => await tmpDir.cleanup()
+        }
+        const server = new Server({
+            storage: useFS ? tmpDir.path : ram,
+            network: { bootstrap: [] },
+            noMigrate: true
+        })
+        await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
+            cleanups,
+            ...options
+        }))
+    }
+
+    const singleServerHypercoreFun = async function (deferred, histograms, useFS, message, blocks, readerCount) {
+        histograms['messageLen.fix'] = newFixedHist(message.length)
+
+        await singleServerFun(deferred, histograms, useFS, {
+            writeFun: (core) => writeMessage(core, message),
+            readFun: (core, idx) => readMessage(core, idx, message),
+            blocks, readerCount
+        })
+    }
+
+    const singleServerHyperdriveFun = async function (deferred, histograms, useFS, message, blocks, readerCount) {
+        histograms['messageLen.fix'] = newFixedHist(message.length)
+
+        await singleServerFun(deferred, histograms, useFS, {
+            writeFun: (drive, idx) => writeFile(drive, idx, message),
+            readFun: (drive, idx) => readFile(drive, idx, message),
+            blocks, readerCount, useDrive: true
+        })
+    }
+
     await executeBenchmark('Create single RAM server, write 1 block with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const server = new Server({
-                storage: ram,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (core) => writeMessage(core, 'helloworld'),
-                readFun: (core, idx) => readMessage(core, idx, 'helloworld'),
-                blocks: 1
-            }))
-            deferred.resolve()
-        })
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, false, message10B, 1, 1)
+    )
 
     await executeBenchmark('Create single FS server, write 1 block with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
-            const server = new Server({
-                storage: tmpDir.path,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (core) => writeMessage(core, 'helloworld'),
-                readFun: (core, idx) => readMessage(core, idx, 'helloworld'),
-                blocks: 1
-            }))
-            deferred.resolve()
-            await record(histograms, 'cleanup dir', async () => await tmpDir.cleanup())
-        })
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, true, message10B, 1, 1)
+    )
 
     await executeBenchmark('Create single RAM server, write 1000 blocks with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const server = new Server({
-                storage: ram,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (core) => writeMessage(core, 'helloworld'),
-                readFun: (core, idx) => readMessage(core, idx, 'helloworld'),
-                blocks: 1000
-            }))
-            deferred.resolve()
-        })
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, false, message10B, 1000, 1)
+    )
 
     await executeBenchmark('Create single FS server, write 1000 blocks with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
-            const server = new Server({
-                storage: tmpDir.path,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (core) => writeMessage(core, 'helloworld'),
-                readFun: (core, idx) => readMessage(core, idx, 'helloworld'),
-                blocks: 1000
-            }))
-            deferred.resolve()
-            await record(histograms, 'cleanup dir', async () => await tmpDir.cleanup())
-        })
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, true, message10B, 1000, 1)
+    )
+
+    await executeBenchmark('Create single RAM server, write 1000 blocks with 10B and read from another 10 clients',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, false, message10B, 1000, 10)
+    )
 
     await executeBenchmark('Create single FS server, write 1000 blocks with 10B and read from another 10 clients',
         {},
-        async function (deferred, histograms) {
-            const tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
-            const server = new Server({
-                storage: tmpDir.path,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (core) => writeMessage(core, 'helloworld'),
-                readFun: (core, idx) => readMessage(core, idx, 'helloworld'),
-                blocks: 1000,
-                readerCount: 10,
-            }))
-            deferred.resolve()
-            await record(histograms, 'cleanup dir', async () => await tmpDir.cleanup())
-        })
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, true, message10B, 1000, 10)
+    )
 
+    await executeBenchmark('Create single RAM server, write 1000 blocks with 1KB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, false, message1KB, 1000, 1)
+    )
+
+    await executeBenchmark('Create single FS server, write 1000 blocks with 1KB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, true, message1KB, 1000, 1)
+    )
+
+    await executeBenchmark('Create single RAM server, write 100 blocks with 1MB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, false, message1MB, 100, 1)
+    )
+
+    await executeBenchmark('Create single FS server, write 100 blocks with 1MB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHypercoreFun(deferred, histograms, true, message1MB, 100, 1)
+    )
+
+    // DHT
     const benchmarkDHTFn = function (message, blocks) {
         return async function (deferred, histograms) {
             let cleanups = {}
@@ -391,12 +416,9 @@ async function runAll() {
                         await client.network.configure(discoveryKey, { announce: false, lookup: true })
                     }
                     await readMessage(feed, blockIdx, message)
-                }
+                },
+                cleanups
             }))
-            // cleanup
-            for (const key in cleanups) {
-                await record(histograms, 'close.' + key, async () => await cleanups[key]())
-            }
             deferred.resolve()
         }
     }
@@ -416,97 +438,67 @@ async function runAll() {
 
     // hyperdrive
 
-    await executeBenchmark('Hyperdrive - Create single RAM server, write 1 file with 10B and read from another client',
+    await executeBenchmark('Hyperdrive - Create single RAM server, write 1 block with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const server = new Server({
-                storage: ram,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (drive, idx) => writeFile(drive, idx, 'helloworld'),
-                readFun: (drive, idx) => readFile(drive, idx, 'helloworld'),
-                blocks: 1,
-                useDrive: true
-            }))
-            deferred.resolve()
-        })
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, false, message10B, 1, 1)
+    )
 
     await executeBenchmark('Hyperdrive - Create single FS server, write 1 block with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
-            const server = new Server({
-                storage: tmpDir.path,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (drive, idx) => writeFile(drive, idx, 'helloworld'),
-                readFun: (drive, idx) => readFile(drive, idx, 'helloworld'),
-                blocks: 1,
-                useDrive: true
-            }))
-            deferred.resolve()
-            await record(histograms, 'cleanup dir', async () => await tmpDir.cleanup())
-        })
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, true, message10B, 1, 1)
+    )
 
     await executeBenchmark('Hyperdrive - Create single RAM server, write 1000 blocks with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const server = new Server({
-                storage: ram,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (drive, idx) => writeFile(drive, idx, 'helloworld'),
-                readFun: (drive, idx) => readFile(drive, idx, 'helloworld'),
-                blocks: 1000,
-                useDrive: true
-            }))
-            deferred.resolve()
-        })
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, false, message10B, 1000, 1)
+    )
 
     await executeBenchmark('Hyperdrive - Create single FS server, write 1000 blocks with 10B and read from another client',
         {},
-        async function (deferred, histograms) {
-            const tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
-            const server = new Server({
-                storage: tmpDir.path,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (drive, idx) => writeFile(drive, idx, 'helloworld'),
-                readFun: (drive, idx) => readFile(drive, idx, 'helloworld'),
-                blocks: 1000,
-                useDrive: true
-            }))
-            deferred.resolve()
-            await record(histograms, 'cleanup dir', async () => await tmpDir.cleanup())
-        })
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, true, message10B, 1000, 1)
+    )
+
+    await executeBenchmark('Hyperdrive - Create single RAM server, write 1000 blocks with 10B and read from another 10 clients',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, false, message10B, 1000, 10)
+    )
 
     await executeBenchmark('Hyperdrive - Create single FS server, write 1000 blocks with 10B and read from another 10 clients',
         {},
-        async function (deferred, histograms) {
-            const tmpDir = await record(histograms, 'mkdir', async () => await tmp.dir({ unsafeCleanup: true }))
-            const server = new Server({
-                storage: tmpDir.path,
-                network: { bootstrap: [] },
-                noMigrate: true
-            })
-            await record(histograms, 'readAndWrite', async () => await readAndWrite(histograms, server, {
-                writeFun: (drive, idx) => writeFile(drive, idx, 'helloworld'),
-                readFun: (drive, idx) => readFile(drive, idx, 'helloworld'),
-                blocks: 1000,
-                readerCount: 10,
-                useDrive: true
-            }))
-            deferred.resolve()
-            await record(histograms, 'cleanup dir', async () => await tmpDir.cleanup())
-        })
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, true, message10B, 1000, 10)
+    )
+
+    await executeBenchmark('Hyperdrive - Create single RAM server, write 1000 blocks with 1KB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, false, message1KB, 1000, 1)
+    )
+
+    await executeBenchmark('Hyperdrive - Create single FS server, write 1000 blocks with 1KB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, true, message1KB, 1000, 1)
+    )
+
+    await executeBenchmark('Hyperdrive - Create single RAM server, write 100 blocks with 1MB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, false, message1MB, 100, 1)
+    )
+
+    await executeBenchmark('Hyperdrive - Create single FS server, write 100 blocks with 1MB and read from another client',
+        {},
+        async (deferred, histograms) =>
+            await singleServerHyperdriveFun(deferred, histograms, true, message1MB, 100, 1)
+    )
+    console.log("globalCtx")
+    console.log(JSON.stringify(globalCtx))
     printCSV()
 }
 
@@ -546,4 +538,3 @@ function printCSV() {
 require('events').EventEmitter.defaultMaxListeners = 20; // avoid warning when registering 10 reader clients
 if (useWasmForHistograms) hdr.initWebAssemblySync() // faster hdr metrics
 runAll() // execute benchmarks
-
